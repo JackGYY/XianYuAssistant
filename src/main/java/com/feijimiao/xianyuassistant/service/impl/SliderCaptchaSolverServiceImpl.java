@@ -161,28 +161,48 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
     @Override
     public boolean trySolveInPage(Long accountId, Page page) {
         try {
-            ElementHandle slider = waitForSlider(page);
-            if (slider == null) {
+            // 先关闭可能遮挡滑块的「连接中断」等模态框，避免其遮罩拦截鼠标事件
+            dismissBlockingModal(page);
+
+            SliderTarget target = waitForSlider(page);
+            if (target == null) {
                 log.info("【账号{}】当前页面未出现滑块，无需处理", accountId);
                 return false;
             }
-            log.info("【账号{}】检测到滑块，开始拖动", accountId);
+            ElementHandle slider = target.handle;
+            Frame frame = target.frame;
+            if (slider == null) {
+                slider = findSliderInFrame(frame);
+            }
+            if (slider == null) {
+                log.warn("【账号{}】检测到验证容器但未能定位滑块把手", accountId);
+                return false;
+            }
+            log.info("【账号{}】检测到滑块（iframe: {}），开始拖动", accountId, frame.url());
+
+            try {
+                slider.scrollIntoViewIfNeeded();
+            } catch (Exception ignored) {
+                log.error("slider error",ignored);
+            }
 
             // 闲鱼/阿里云 nc 滑块为「划到头即过」类型，优先使用「滑到轨道末端」策略
-            Double distance = computeMaxSlideDistance(page, slider);
+            Double distance = computeMaxSlideDistance(page, slider, frame);
             if (distance == null || distance <= 0) {
                 log.warn("【账号{}】无法计算轨道末端距离，尝试模板匹配缺口兜底", accountId);
                 distance = computeDragDistance(page);
             }
             if (distance == null || distance <= 0) {
                 log.warn("【账号{}】模板匹配也失败，尝试整条轨道拖动兜底", accountId);
-                distance = fallbackDistance(page, slider);
+                distance = fallbackDistance(page, slider, frame);
             }
             if (distance == null || distance <= 0) {
                 return false;
             }
 
             boolean success = dragSlider(page, slider, distance);
+            // 无论成功失败都抓取一次滑块状态，判断是否被风控（left 回弹到 0、提示文本变为失败等）
+            captureSliderDiagnostics(frame, slider);
             if (success) {
                 log.info("【账号{}】滑块验证通过", accountId);
                 if (operationLogService != null) {
@@ -206,26 +226,62 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
     }
 
     /**
-     * 等待滑块出现，返回滑块把手元素
+     * 滑块目标：记录滑块把手元素及其所在的 frame（滑块可能位于 iframe 内）
      */
-    private ElementHandle waitForSlider(Page page) {
+    private static class SliderTarget {
+        final ElementHandle handle;
+        final Frame frame;
+        SliderTarget(ElementHandle handle, Frame frame) {
+            this.handle = handle;
+            this.frame = frame;
+        }
+    }
+
+    /**
+     * 等待滑块出现，返回滑块把手元素及其所在 frame
+     * <p>
+     * 注意：闲鱼滑块验证码（阿里云 baxia）渲染在 iframe 内部（#baxia-dialog-content），
+     * 主页面的 querySelector 无法命中，因此必须遍历所有 frame 查找。
+     */
+    private SliderTarget waitForSlider(Page page) {
         long deadline = System.currentTimeMillis() + SLIDER_WAIT_TIMEOUT;
+        if (log.isDebugEnabled()) {
+            StringBuilder sb = new StringBuilder();
+            for (Frame f : page.frames()) {
+                sb.append(f.url()).append(" | ");
+            }
+            log.debug("【滑块诊断】当前页面 frames: {}", sb);
+        }
         while (System.currentTimeMillis() < deadline) {
-            for (String selector : SLIDER_HANDLE_SELECTORS) {
-                try {
-                    ElementHandle handle = page.querySelector(selector);
-                    if (handle != null) {
-                        return handle;
+            // 遍历所有 frame（含 iframe）查找滑块把手
+            for (Frame frame : page.frames()) {
+                for (String selector : SLIDER_HANDLE_SELECTORS) {
+                    try {
+                        ElementHandle handle = frame.querySelector(selector);
+                        if (handle != null && handle.isVisible()) {
+                            return new SliderTarget(handle, frame);
+                        }
+                    } catch (Exception e) {
+                        // 跨域 iframe 等可能抛异常，仅 debug 记录，方便判断是不是同源限制导致找不到
+                        if (log.isDebugEnabled()) {
+                            log.debug("【滑块诊断】frame[{}] 查询选择器[{}]异常: {}",
+                                    frame.url(), selector, e.getMessage());
+                        }
                     }
-                } catch (Exception ignored) {
-                    // 某些选择器在当前 DOM 下不存在，忽略
                 }
             }
-            // 兜底：通过 canvas 判断是否存在拼图验证码
+            // 兜底：通过 canvas 判断是否存在拼图验证码，找到其所在 frame
             if (hasPuzzleCanvas(page)) {
-                ElementHandle any = page.querySelector("[class*='nc_scale'], [class*='slider'], [class*='captcha']");
-                if (any != null) {
-                    return any;
+                for (Frame frame : page.frames()) {
+                    try {
+                        ElementHandle any = frame.querySelector(
+                                "[class*='nc_scale'], [class*='slider'], [class*='captcha']");
+                        if (any != null && any.isVisible()) {
+                            ElementHandle handle = findSliderInFrame(frame);
+                            return new SliderTarget(handle != null ? handle : any, frame);
+                        }
+                    } catch (Exception ignored) {
+                    }
                 }
             }
             try {
@@ -236,6 +292,46 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
             }
         }
         return null;
+    }
+
+    /**
+     * 在指定 frame 内查找滑块把手
+     */
+    private ElementHandle findSliderInFrame(Frame frame) {
+        for (String selector : SLIDER_HANDLE_SELECTORS) {
+            try {
+                ElementHandle handle = frame.querySelector(selector);
+                if (handle != null && handle.isVisible()) {
+                    return handle;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 关闭可能遮挡滑块的「连接中断」等 Ant Design 模态框，避免其遮罩拦截鼠标事件
+     */
+    private void dismissBlockingModal(Page page) {
+        try {
+            Boolean closed = page.evaluate(
+                    "() => {" +
+                            "  const modals = Array.from(document.querySelectorAll('.ant-modal'));" +
+                            "  for (const m of modals) {" +
+                            "    const title = m.querySelector('.ant-modal-title');" +
+                            "    if (title && title.innerText.includes('连接中断')) {" +
+                            "      const closeBtn = m.querySelector('.ant-modal-close');" +
+                            "      if (closeBtn) { closeBtn.click(); return true; }" +
+                            "    }" +
+                            "  }" +
+                            "  return false;" +
+                            "}").equals(Boolean.TRUE);
+            if (closed) {
+                log.info("已关闭「连接中断」模态框，避免遮挡滑块交互");
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     /**
@@ -285,10 +381,10 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
      * 闲鱼/阿里云 nc 滑块为「拖动到轨道末端即验证通过」类型，无需精确定位缺口，
      * 直接把手柄拖动到轨道右端即可。
      */
-    private Double computeMaxSlideDistance(Page page, ElementHandle slider) {
+    private Double computeMaxSlideDistance(Page page, ElementHandle slider, Frame frame) {
         try {
-            // 优先找轨道容器（滑块的父级轨道）
-            ElementHandle track = page.querySelector(
+            // 优先找轨道容器（滑块的父级轨道），滑块可能在 iframe 内，需在对应 frame 查找
+            ElementHandle track = frame.querySelector(
                     "[class*='nc_scale'], [class*='nc_btn'], [class*='slider'], [class*='captcha']");
             if (track == null) {
                 track = slider;
@@ -429,9 +525,9 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
     /**
      * 兜底距离：将把手拖到轨道末端附近
      */
-    private Double fallbackDistance(Page page, ElementHandle slider) {
+    private Double fallbackDistance(Page page, ElementHandle slider, Frame frame) {
         try {
-            ElementHandle track = page.querySelector("[class*='nc_scale'], [class*='slider'], [class*='captcha']");
+            ElementHandle track = frame.querySelector("[class*='nc_scale'], [class*='slider'], [class*='captcha']");
             if (track == null) {
                 return null;
             }
@@ -517,16 +613,23 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
         long deadline = System.currentTimeMillis() + RESULT_WAIT_TIMEOUT;
         while (System.currentTimeMillis() < deadline) {
             try {
-                String text = page.evaluate("() => document.body ? document.body.innerText : ''").toString();
-                if (text != null && (text.contains("验证成功") || text.contains("通过验证") || text.contains("验证通过"))) {
-                    return true;
-                }
-                // 成功时滑块容器通常会增加 ok 类
-                Boolean ok = page.evaluate(
-                        "() => !!document.querySelector('[class*=\"nc_ok\"], [class*=\"success\"], [class*=\"passed\"]')")
-                        .equals(Boolean.TRUE);
-                if (ok) {
-                    return true;
+                // 滑块在 iframe 内，需要在所有 frame 中检查验证结果
+                for (Frame frame : page.frames()) {
+                    try {
+                        Object textObj = frame.evaluate("() => document.body ? document.body.innerText : ''");
+                        String text = textObj == null ? "" : textObj.toString();
+                        if (text != null && (text.contains("验证成功") || text.contains("通过验证") || text.contains("验证通过"))) {
+                            return true;
+                        }
+                        // 成功时滑块容器通常会增加 ok 类
+                        Boolean ok = frame.evaluate(
+                                "() => !!document.querySelector('[class*=\"nc_ok\"], [class*=\"success\"], [class*=\"passed\"]')")
+                                .equals(Boolean.TRUE);
+                        if (ok) {
+                            return true;
+                        }
+                    } catch (Exception ignored) {
+                    }
                 }
             } catch (Exception ignored) {
             }
@@ -538,6 +641,25 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
             }
         }
         return false;
+    }
+
+    /**
+     * 抓取滑块拖拽后的状态，用于判断是否被风控拒绝：
+     * - handle.left 回弹到 0 附近 → 拖动无效（轨迹被识别 / 距离不对）
+     * - 提示文本包含「失败」「再试」→ 验证未通过
+     * - nc_bg 宽度仍为 0 → 未真正滑动
+     */
+    private void captureSliderDiagnostics(Frame frame, ElementHandle slider) {
+        try {
+            Object left = slider.evaluate("el => el.style.left || 'n/a'");
+            Object txt = frame.evaluate(
+                    "() => { const t = document.querySelector('.nc-lang-cnt'); return t ? t.innerText : ''; }");
+            Object bgW = frame.evaluate(
+                    "() => { const b = document.querySelector('[class*=\"nc_bg\"]'); return b ? b.style.width : ''; }");
+            log.info("【滑块诊断】handle.left={}, 提示文本={}, 进度条width={}", left, txt, bgW);
+        } catch (Exception e) {
+            log.debug("读取滑块诊断信息失败（元素可能已随验证结果刷新）", e);
+        }
     }
 
     // ===================== 工具方法 =====================
