@@ -121,6 +121,17 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
     private static final long RETRY_INTERVAL_RANDOM = 1000;
 
     /**
+     * 频控（被挤爆啦/RGV587_ERROR）冷却重试的最大次数
+     * 频控是频率限制而非真正的滑块，冷却一段时间后通常可自动恢复
+     */
+    private static final int MAX_RISK_CONTROL_RETRY = 3;
+
+    /**
+     * 频控冷却等待时间（毫秒），给闲鱼风控留出恢复窗口
+     */
+    private static final long RISK_CONTROL_COOLDOWN = 30 * 1000;
+
+    /**
      * 每个账号的Token获取锁，防止并发获取
      */
     private final Map<Long, Object> tokenLocks = new ConcurrentHashMap<>();
@@ -145,7 +156,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
     @Override
     public String getAccessToken(Long accountId) {
         synchronized (getTokenLock(accountId)) {
-            return getAccessTokenWithRetry(accountId, 0);
+            return getAccessTokenWithRetry(accountId, 0, 0);
         }
     }
 
@@ -182,7 +193,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
      * @param retryCount 当前重试次数
      * @return accessToken
      */
-    private String getAccessTokenWithRetry(Long accountId, int retryCount) {
+    private String getAccessTokenWithRetry(Long accountId, int retryCount, int riskControlRetryCount) {
         try {
             // 0. 检查是否正在等待验证
             if (pendingCaptchaAccounts.containsKey(accountId)) {
@@ -372,6 +383,33 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                         }
                     }
 
+                    // 【方案B：频控优先】RGV587_ERROR / 被挤爆啦 属于频率限制（风控），
+                    // 并非真正的滑块，冷却一段时间（默认30秒）后通常可自动恢复。
+                    // 因此优先于滑块判断处理：冷却后重试，最多 MAX_RISK_CONTROL_RETRY 次。
+                    boolean needRiskControl = retList.stream().anyMatch(ret -> ret.contains("RGV587_ERROR") || ret.contains("被挤爆啦"));
+                    if (needRiskControl) {
+                        if (riskControlRetryCount < MAX_RISK_CONTROL_RETRY) {
+                            riskControlRetryCount++;
+                            log.warn("【账号{}】检测到频控(被挤爆啦/RGV587)，冷却 {} 秒后重试 (第{}/{}次)",
+                                    accountId, RISK_CONTROL_COOLDOWN / 1000, riskControlRetryCount, MAX_RISK_CONTROL_RETRY);
+                            try {
+                                Thread.sleep(RISK_CONTROL_COOLDOWN);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                log.warn("【账号{}】频控冷却等待被中断", accountId);
+                                return null;
+                            }
+                            return getAccessTokenWithRetry(accountId, retryCount, riskControlRetryCount);
+                        } else {
+                            log.error("【账号{}】❌ 频控冷却重试已达上限({})，转人工处理: {}",
+                                    accountId, MAX_RISK_CONTROL_RETRY, retList);
+                            log.error("【账号{}】请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie", accountId);
+                            updateCookieStatus(accountId, 3);
+                            throw new com.feijimiao.xianyuassistant.exception.CookieExpiredException(
+                                    "触发频控(被挤爆啦)，冷却重试后仍失败，请进入闲鱼网页版过滑块后更新Cookie");
+                        }
+                    }
+
                     // 检查是否需要滑块验证
                     boolean needCaptcha = retList.stream().anyMatch(ret -> ret.contains("FAIL_SYS_USER_VALIDATE"));
                     log.info("【账号{}】是否需要滑块验证: {}", accountId, needCaptcha);
@@ -401,7 +439,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                                             log.info("【账号{}】自动过滑块成功，重新获取Token", accountId);
                                             pendingCaptchaAccounts.remove(accountId);
                                             captchaTimestamps.remove(accountId);
-                                            return getAccessTokenWithRetry(accountId, retryCount);
+                                            return getAccessTokenWithRetry(accountId, retryCount, 0);
                                         }
                                     } catch (Exception ex) {
                                         log.warn("【账号{}】自动过滑块异常，转为人工处理", accountId, ex);
@@ -417,16 +455,6 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                         } else {
                             log.error("【账号{}】需要滑块验证但未找到URL", accountId);
                         }
-                    }
-
-                    // 检查是否触发风控（RGV587_ERROR）
-                    boolean needRiskControl = retList.stream().anyMatch(ret -> ret.contains("RGV587_ERROR") || ret.contains("被挤爆啦"));
-                    if (needRiskControl) {
-                        log.error("【账号{}】❌ 触发风控: {}", accountId, retList);
-                        log.error("【账号{}】系统目前无法自动解决，请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie", accountId);
-                        updateCookieStatus(accountId, 3);
-                        throw new com.feijimiao.xianyuassistant.exception.CookieExpiredException(
-                                "触发风控，请进入闲鱼网页版过滑块后更新Cookie");
                     }
                 }
 
@@ -555,7 +583,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                 Thread.currentThread().interrupt();
             }
 
-            return getAccessTokenWithRetry(accountId, retryCount + 1);
+            return getAccessTokenWithRetry(accountId, retryCount + 1, 0);
         }
 
         log.warn("【账号{}】Token获取重试已达上限，尝试通过hasLogin刷新Cookie...", accountId);
@@ -621,7 +649,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                                     ? newMh5tk.split("_")[0].substring(0, Math.min(10, newMh5tk.split("_")[0].length())) + "..."
                                     : "空");
                     // 重置retryCount为0，重新开始获取token流程
-                    return getAccessTokenWithRetry(accountId, 0);
+                    return getAccessTokenWithRetry(accountId, 0, 0);
                 } else {
                     log.error("【账号{}】hasLogin后获取刷新后的Cookie失败", accountId);
                 }
@@ -810,7 +838,7 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                 clearToken(accountId);
 
                 // 2. 获取新token
-                String newToken = getAccessTokenWithRetry(accountId, 0);
+                String newToken = getAccessTokenWithRetry(accountId, 0, 0);
 
                 if (newToken != null && !newToken.isEmpty()) {
                     log.info("【账号{}】✅ WebSocket token刷新成功", accountId);
