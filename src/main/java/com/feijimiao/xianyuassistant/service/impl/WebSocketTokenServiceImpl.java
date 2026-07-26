@@ -383,12 +383,17 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                         }
                     }
 
-                    // 【方案B：频控优先】RGV587_ERROR / 被挤爆啦 属于频率限制（风控），
-                    // 并非真正的滑块，冷却一段时间（默认30秒）后通常可自动恢复。
-                    // 因此优先于滑块判断处理：冷却后重试，最多 MAX_RISK_CONTROL_RETRY 次。
+                    // 【方案B：频控处理】RGV587_ERROR / 被挤爆啦 属于频率限制（风控），
+                    // 冷却一段时间（默认30秒）后通常可自动恢复，因此冷却后重试，最多 MAX_RISK_CONTROL_RETRY 次。
+                    // 但若频控与滑块(FAIL_SYS_USER_VALIDATE)同时出现，说明Cookie已失效（风控升级），
+                    // 此时冷却重试对坏Cookie无效，应跳过冷却直接走滑块/人工验证流程（用户手动滑块即可恢复）。
                     boolean needRiskControl = retList.stream().anyMatch(ret -> ret.contains("RGV587_ERROR") || ret.contains("被挤爆啦"));
                     if (needRiskControl) {
-                        if (riskControlRetryCount < MAX_RISK_CONTROL_RETRY) {
+                        // 频控 + 滑块同现：Cookie 已失效，跳过冷却，落到下方滑块处理
+                        boolean riskWithCaptcha = retList.stream().anyMatch(ret -> ret.contains("FAIL_SYS_USER_VALIDATE"));
+                        if (riskWithCaptcha) {
+                            log.warn("【账号{}】频控(被挤爆啦/RGV587) 与滑块(FAIL_SYS_USER_VALIDATE) 同时出现，判定Cookie已失效，跳过冷却直接走滑块处理", accountId);
+                        } else if (riskControlRetryCount < MAX_RISK_CONTROL_RETRY) {
                             riskControlRetryCount++;
                             log.warn("【账号{}】检测到频控(被挤爆啦/RGV587)，冷却 {} 秒后重试 (第{}/{}次)",
                                     accountId, RISK_CONTROL_COOLDOWN / 1000, riskControlRetryCount, MAX_RISK_CONTROL_RETRY);
