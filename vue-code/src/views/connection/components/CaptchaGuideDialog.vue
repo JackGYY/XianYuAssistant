@@ -4,7 +4,7 @@ import { autoSolveCaptcha } from '@/api/websocket';
 
 interface Props {
   modelValue: boolean;
-  accountId?: number;
+  accountId?: number | null;
 }
 
 interface Emits {
