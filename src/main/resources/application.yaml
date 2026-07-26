@@ -67,3 +67,7 @@ websocket:
   message-retry-delay: 1000
   # 打印原始消息开关（解密后的消息）
   print-raw-message: true
+logging:
+  level:
+    com.feijimiao.xianyuassistant.service.impl.SliderCaptchaSolverServiceImpl: DEBUG
+
