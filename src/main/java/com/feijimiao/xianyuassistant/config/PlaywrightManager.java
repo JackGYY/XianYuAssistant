@@ -10,9 +10,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -25,28 +28,61 @@ public class PlaywrightManager {
     private final ReentrantLock lock = new ReentrantLock();
     private volatile boolean initialized = false;
 
+    /** 用于视口随机化，避免所有浏览器实例指纹完全一致 */
+    private static final Random RANDOM = new Random();
+
+    /** 浏览器缓存目录，可被环境变量 PLAYWRIGHT_BROWSERS_PATH 覆盖 */
     private static final String BROWSER_CACHE_DIR;
 
+    /** 是否无头模式，可被环境变量 PLAYWRIGHT_HEADLESS 覆盖（默认无头） */
+    private static final boolean HEADLESS;
+
     static {
-        String jarDir = getJarDirectory();
-        BROWSER_CACHE_DIR = jarDir + File.separator + "ms-playwright";
-        System.setProperty("PLAYWRIGHT_BROWSERS_PATH", BROWSER_CACHE_DIR);
+        // 兼容 Windows / Linux：浏览器目录优先读取环境变量，否则放在可执行文件同目录的 ms-playwright
+        String envPath = System.getenv("PLAYWRIGHT_BROWSERS_PATH");
+        if (envPath == null || envPath.isBlank()) {
+            envPath = System.getProperty("playwright.browsers.path");
+        }
+        if (envPath != null && !envPath.isBlank()) {
+            BROWSER_CACHE_DIR = normalizePath(envPath);
+        } else {
+            String jarDir = getJarDirectory();
+            BROWSER_CACHE_DIR = jarDir + File.separator + "ms-playwright";
+        }
+        // Playwright Java 通过该属性定位浏览器，确保覆盖后的目录真正生效
+        System.setProperty("playwright.browsers.path", BROWSER_CACHE_DIR);
         log.info("Playwright浏览器缓存目录: {}", BROWSER_CACHE_DIR);
+
+        // HEADLESS 开关：PLAYWRIGHT_HEADLESS=false / 0 / no 时启用有头模式，方便本地可视化调试
+        String headlessEnv = System.getenv("PLAYWRIGHT_HEADLESS");
+        if (headlessEnv == null) {
+            headlessEnv = System.getProperty("playwright.headless", "true");
+        }
+        HEADLESS = !(headlessEnv != null && (headlessEnv.equalsIgnoreCase("false")
+                || headlessEnv.equals("0") || headlessEnv.equalsIgnoreCase("no")));
+        log.info("Playwright无头模式: {}", HEADLESS);
     }
 
     private static String getJarDirectory() {
         try {
-            String jarPath = PlaywrightManager.class.getProtectionDomain()
-                    .getCodeSource().getLocation().toURI().getPath();
-            File jarFile = new File(jarPath);
-            if (jarFile.isFile()) {
-                return jarFile.getParent();
-            }
-            return jarFile.getAbsolutePath();
+            // 用 URI -> Path 规范化，避免 Windows 上出现 "/C:/..." 这类带前导斜杠的路径导致解析异常
+            URI uri = PlaywrightManager.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI();
+            Path path = Paths.get(uri);
+            Path dir = Files.isRegularFile(path) ? path.getParent() : path;
+            return dir.toAbsolutePath().toString();
         } catch (Exception e) {
             String userDir = System.getProperty("user.dir");
-            log.warn("无法获取JAR目录，使用user.dir: {}", userDir, e);
+            log.warn("无法获取执行文件目录，使用user.dir: {}", userDir, e);
             return userDir;
+        }
+    }
+
+    private static String normalizePath(String p) {
+        try {
+            return Paths.get(p).toAbsolutePath().toString();
+        } catch (Exception e) {
+            return p;
         }
     }
 
@@ -59,16 +95,16 @@ public class PlaywrightManager {
         lock.lock();
         try {
             ensureBrowserReady();
-            Browser.NewContextOptions contextOptions = new Browser.NewContextOptions()
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-            return browser.newContext(contextOptions);
+            BrowserContext context = browser.newContext(buildContextOptions());
+            applyAntiDetect(context);
+            return context;
         } catch (Exception e) {
             log.error("创建BrowserContext失败，尝试重建浏览器实例", e);
             try {
                 rebuild();
-                Browser.NewContextOptions contextOptions = new Browser.NewContextOptions()
-                        .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-                return browser.newContext(contextOptions);
+                BrowserContext context = browser.newContext(buildContextOptions());
+                applyAntiDetect(context);
+                return context;
             } catch (Exception ex) {
                 log.error("重建浏览器后仍然失败", ex);
                 throw new RuntimeException("Playwright浏览器不可用", ex);
@@ -76,6 +112,33 @@ public class PlaywrightManager {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 构造贴近真实 Windows Chrome 的上下文参数，降低自动化指纹特征。
+     */
+    private Browser.NewContextOptions buildContextOptions() {
+        // 视口在合理范围内轻微随机，避免所有实例指纹完全一致
+        int width = 1366 + RANDOM.nextInt(555);   // 1366 ~ 1920
+        int height = 768 + RANDOM.nextInt(313);   // 768 ~ 1080
+        return new Browser.NewContextOptions()
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .setLocale("zh-CN")
+                .setTimezoneId("Asia/Shanghai")
+                .setViewportSize(width, height)
+                .setDeviceScaleFactor(1.0)
+                .setHasTouch(false)
+                .setJavaScriptEnabled(true);
+    }
+
+    /**
+     * 注入反检测脚本：清除 navigator.webdriver 标记，规避 Playwright 默认自动化特征。
+     * 该脚本会在每个页面加载前执行，对所有导航生效。
+     */
+    private void applyAntiDetect(BrowserContext context) {
+        context.addInitScript(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        );
     }
 
     private void ensureBrowserReady() {
@@ -96,7 +159,9 @@ public class PlaywrightManager {
             }
             this.playwright = Playwright.create();
             BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()
-                    .setHeadless(true);
+                    .setHeadless(HEADLESS)
+                    // 容器环境 /dev/shm 通常很小，不加会导致 Chromium 崩溃；对本地环境同样安全
+                    .setArgs(Arrays.asList("--disable-dev-shm-usage"));
             this.browser = this.playwright.chromium().launch(launchOptions);
             this.initialized = true;
             log.info("Playwright浏览器初始化成功");

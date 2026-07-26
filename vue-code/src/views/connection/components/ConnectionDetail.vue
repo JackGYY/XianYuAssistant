@@ -151,6 +151,11 @@ const handleCaptchaConfirm = () => {
   showInfo('请完成验证后使用帮助按钮获取凭证')
 }
 
+const handleCaptchaSolved = () => {
+  showSuccess('滑块已自动通过，正在刷新连接状态')
+  loadConnectionStatus()
+}
+
 const getCookieStatusText = (status?: number) => {
   if (status === undefined || status === null) return '未知'
   const map: Record<number, string> = { 1: '有效', 2: '过期', 3: '失效' }
@@ -359,7 +364,9 @@ onBeforeUnmount(() => {
     />
     <CaptchaGuideDialog
       v-model="showCaptchaGuideDialog"
+      :account-id="props.accountId"
       @confirm="handleCaptchaConfirm"
+      @solved="handleCaptchaSolved"
     />
   </div>
 </template>

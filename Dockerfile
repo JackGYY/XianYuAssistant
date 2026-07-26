@@ -38,19 +38,44 @@ COPY src/ src/
 # 构建 JAR（跳过测试）
 RUN ./mvnw clean package -DskipTests
 
-# 阶段3: 运行时镜像
-FROM eclipse-temurin:21-jre-alpine
+# 阶段3: 构建 Playwright Chromium 浏览器二进制（glibc 版，版本与 pom 中 playwright 1.40.0 对齐）
+# 注意：必须在 glibc 系统（Debian/Ubuntu）上构建，Alpine(musl) 上的 Chromium 无法运行。
+FROM node:20-bookworm AS playwright-browser
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install -g playwright@1.40.0 \
+    && npx playwright install chromium
+
+# 阶段4: 运行时镜像
+# 使用 Ubuntu(jammy) 的 glibc 基础镜像，Playwright Chromium 才能正常运行（Alpine 的 musl 不兼容）
+FROM eclipse-temurin:21-jre-jammy
 
 LABEL maintainer="IAMLZY"
-LABEL description="XianYuAssistant - 闲鱼自动化管理系统"
+LABEL description="XianYuAssistant - 闲鱼自动化管理系统（含 Playwright Chromium，支持自动过滑块）"
 
 WORKDIR /app
 
-# 创建数据目录
-RUN mkdir -p /app/dbdata /app/logs /app/ms-playwright
+# 安装 Playwright Chromium 运行所需的系统库（glibc 版）及中文字体（滑块页面渲染需要）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+        libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+        libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
+        libxshmfence1 libx11-6 libxcb1 libxext6 libxrender1 libxi6 libxinerama1 \
+        libxcursor1 libxtst6 libwoff1 libvulkan1 \
+        fonts-liberation fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建非 root 用户运行，避免 Chromium 以 root 启动需要 --no-sandbox
+RUN groupadd -r appgroup && useradd -r -g appgroup -u 1000 appuser \
+    && mkdir -p /app/dbdata /app/logs /app/ms-playwright \
+    && chown -R appuser:appgroup /app
 
 # 从构建阶段复制 JAR
-COPY --from=backend-build /app/target/XianYuAssistant-2.0.3.jar app.jar
+COPY --from=backend-build --chown=appuser:appgroup /app/target/XianYuAssistant-2.0.3.jar app.jar
+
+# 复制预构建的 Chromium 浏览器二进制到 PlaywrightManager 期望的 /app/ms-playwright
+COPY --from=playwright-browser --chown=appuser:appgroup /app/ms-playwright /app/ms-playwright
 
 # 暴露端口
 EXPOSE 12400
@@ -59,6 +84,11 @@ EXPOSE 12400
 ENV JAVA_OPTS="-Xms256m -Xmx512m"
 ENV SERVER_PORT=12400
 ENV ALI_API_KEY=""
+# 明确指向镜像内已装好的浏览器目录，与 PlaywrightManager 默认查找路径一致
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/ms-playwright
+
+# 以非 root 用户运行（Chromium 安全性 & 避免 --no-sandbox）
+USER appuser
 
 # 启动命令
 ENTRYPOINT ["sh", "-c", "java ${JAVA_OPTS} -Dserver.port=${SERVER_PORT} -jar app.jar"]

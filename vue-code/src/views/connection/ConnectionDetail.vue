@@ -171,6 +171,11 @@ const handleCaptchaConfirm = () => {
   showInfo('请完成验证后使用帮助按钮获取凭证')
 }
 
+const handleCaptchaSolved = () => {
+  showSuccess('滑块已自动通过，正在刷新连接状态')
+  loadConnectionStatus()
+}
+
 const handleBack = () => {
   router.push('/connection')
 }
@@ -461,7 +466,9 @@ onBeforeUnmount(() => {
     />
     <CaptchaGuideDialog
       v-model="showCaptchaGuideDialog"
+      :account-id="accountId"
       @confirm="handleCaptchaConfirm"
+      @solved="handleCaptchaSolved"
     />
   </div>
 </template>

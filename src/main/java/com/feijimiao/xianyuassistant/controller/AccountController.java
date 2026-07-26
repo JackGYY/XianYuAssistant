@@ -19,6 +19,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 账号管理控制器
@@ -34,6 +35,9 @@ public class AccountController {
     
     @Autowired
     private AccountService accountService;
+
+    @Autowired(required = false)
+    private com.feijimiao.xianyuassistant.service.CookieRefreshService cookieRefreshService;
 
     /**
      * 获取账号列表
@@ -220,6 +224,42 @@ public class AccountController {
         } catch (Exception e) {
             log.error("获取账号详情失败", e);
             return ResultObject.failed("获取账号详情失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 自动过滑块验证
+     * <p>
+     * 触发 Playwright 自动识别并拖动滑块，验证通过后回写最新 Cookie。
+     */
+    @PostMapping("/auto-captcha")
+    public ResultObject<Map<String, Object>> autoSolveCaptcha(@RequestBody GetAccountDetailReqDTO reqDTO) {
+        try {
+            Long id = reqDTO.getAccountId();
+            if (id == null) {
+                return ResultObject.failed("账号ID不能为空");
+            }
+            XianyuAccount account = accountMapper.selectById(id);
+            if (account == null) {
+                return ResultObject.failed("账号不存在");
+            }
+            if (cookieRefreshService == null) {
+                return ResultObject.failed("滑块自动处理服务不可用");
+            }
+            String newCookie = cookieRefreshService.autoSolveCaptcha(id);
+            Map<String, Object> data = new java.util.HashMap<>();
+            if (newCookie != null && !newCookie.isBlank()) {
+                data.put("success", true);
+                data.put("message", "滑块验证已自动通过，Cookie 已更新");
+                return ResultObject.success(data);
+            } else {
+                data.put("success", false);
+                data.put("message", "自动过滑块失败，请尝试手动处理（访问 goofish.com/im 过滑块后更新 Cookie）");
+                return ResultObject.failed("自动过滑块失败");
+            }
+        } catch (Exception e) {
+            log.error("自动过滑块异常", e);
+            return ResultObject.failed("自动过滑块异常: " + e.getMessage());
         }
     }
 

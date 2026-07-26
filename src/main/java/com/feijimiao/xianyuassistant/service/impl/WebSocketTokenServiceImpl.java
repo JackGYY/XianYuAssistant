@@ -95,6 +95,12 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
     private static final long CAPTCHA_TIMEOUT = 5 * 60 * 1000;
 
     /**
+     * 自动过滑块尝试记录（防止短时间内重复拉起浏览器）
+     * Key: accountId, Value: 上次尝试时间戳
+     */
+    private final Map<Long, Long> autoSolveAttempts = new ConcurrentHashMap<>();
+
+    /**
      * Token获取失败重试最大次数（参考Python: retry_count >= 2）
      */
     private static final int MAX_TOKEN_RETRY_COUNT = 2;
@@ -382,6 +388,26 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                             captchaTimestamps.put(accountId, System.currentTimeMillis());
 
                             updateAccountStatusToCaptchaRequired(accountId);
+
+                            // 尝试自动过滑块（最多每5分钟一次，避免重复拉起浏览器）
+                            if (cookieRefreshService != null) {
+                                Long lastAttempt = autoSolveAttempts.get(accountId);
+                                if (lastAttempt == null || System.currentTimeMillis() - lastAttempt > 5 * 60 * 1000) {
+                                    autoSolveAttempts.put(accountId, System.currentTimeMillis());
+                                    log.warn("【账号{}】检测到滑块验证，尝试自动过滑块...", accountId, captchaUrl);
+                                    try {
+                                        String newCookie = cookieRefreshService.autoSolveCaptcha(accountId);
+                                        if (newCookie != null && !newCookie.isBlank()) {
+                                            log.info("【账号{}】自动过滑块成功，重新获取Token", accountId);
+                                            pendingCaptchaAccounts.remove(accountId);
+                                            captchaTimestamps.remove(accountId);
+                                            return getAccessTokenWithRetry(accountId, retryCount);
+                                        }
+                                    } catch (Exception ex) {
+                                        log.warn("【账号{}】自动过滑块异常，转为人工处理", accountId, ex);
+                                    }
+                                }
+                            }
 
                             log.warn("【账号{}】检测到滑块验证，URL: {}", accountId, captchaUrl);
                             log.warn("【账号{}】需要人工完成滑块验证，请访问: http://localhost:8080/websocket-manual-captcha.html", accountId);

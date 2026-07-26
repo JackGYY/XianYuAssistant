@@ -43,4 +43,14 @@ public interface CookieRefreshService {
      * @return 去重后的Cookie字符串
      */
     String clearDuplicateCookies(String cookieStr);
+
+    /**
+     * 自动过滑块验证
+     * <p>
+     * 触发 Playwright 自动识别并拖动滑块，验证通过后回写最新 Cookie。
+     *
+     * @param accountId 账号ID
+     * @return 验证成功返回最新 Cookie 字符串，失败返回 null
+     */
+    String autoSolveCaptcha(Long accountId);
 }

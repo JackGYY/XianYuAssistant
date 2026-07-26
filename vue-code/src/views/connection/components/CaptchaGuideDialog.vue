@@ -1,19 +1,25 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
+import { autoSolveCaptcha } from '@/api/websocket';
 
 interface Props {
   modelValue: boolean;
+  accountId?: number;
 }
 
 interface Emits {
   (e: 'update:modelValue', value: boolean): void;
   (e: 'confirm'): void;
+  (e: 'solved'): void;
 }
 
 const props = defineProps<Props>();
 const emit = defineEmits<Emits>();
 
 const isMobile = ref(false);
+const autoSolving = ref(false);
+const autoMsg = ref('');
+const autoSuccess = ref(false);
 
 const checkDevice = () => {
   isMobile.value = window.innerWidth < 768;
@@ -26,6 +32,31 @@ const handleClose = () => {
 const handleConfirm = () => {
   emit('confirm');
   emit('update:modelValue', false);
+};
+
+const handleAutoSolve = async () => {
+  if (!props.accountId) {
+    autoMsg.value = '未获取到账号ID，无法自动处理';
+    return;
+  }
+  autoSolving.value = true;
+  autoMsg.value = '正在启动浏览器自动过滑块，请稍候（约10-30秒）...';
+  autoSuccess.value = false;
+  try {
+    const res = await autoSolveCaptcha(props.accountId);
+    if (res.code === 0 || res.code === 200) {
+      autoSuccess.value = true;
+      autoMsg.value = (res.data?.message as string) || '滑块验证已自动通过，Cookie 已更新';
+      emit('solved');
+      setTimeout(() => emit('update:modelValue', false), 1500);
+    } else {
+      autoMsg.value = (res.msg as string) || '自动过滑块失败，请尝试手动处理';
+    }
+  } catch (e: any) {
+    autoMsg.value = '自动过滑块异常: ' + (e?.message || e);
+  } finally {
+    autoSolving.value = false;
+  }
 };
 
 onMounted(() => {
@@ -74,9 +105,17 @@ onUnmounted(() => {
               <span class="tip-icon">💡</span>
               <span class="tip-text">更新Cookie后点击"启动连接"，会自动更新WebSocket Token，滑块校验生效会延迟，稍等片刻会自动连接闲鱼服务器</span>
             </div>
+            <div v-if="autoMsg" class="captcha-status" :class="{ 'is-success': autoSuccess }">
+              <span class="status-icon">{{ autoSuccess ? '✅' : '⏳' }}</span>
+              <span class="status-text">{{ autoMsg }}</span>
+            </div>
           </div>
           <div class="modal-footer">
             <button class="btn btn-secondary" @click="handleClose">取消</button>
+            <button class="btn btn-auto" :disabled="autoSolving" @click="handleAutoSolve">
+              <span v-if="autoSolving" class="spinner"></span>
+              {{ autoSolving ? '处理中...' : '自动过滑块' }}
+            </button>
             <button class="btn btn-primary" @click="handleConfirm">访问闲鱼IM</button>
           </div>
         </div>
@@ -266,6 +305,60 @@ onUnmounted(() => {
 
 .btn-primary:hover {
   background: #0077ed;
+}
+
+.btn-auto {
+  background: #34c759;
+  color: rgba(255,255,255,0.55);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-auto:hover {
+  background: #2fb350;
+}
+
+.btn-auto:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255,255,255,0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.captcha-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 149, 0, 0.08);
+  border-radius: 10px;
+}
+
+.captcha-status.is-success {
+  background: rgba(52, 199, 89, 0.1);
+}
+
+.status-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.status-text {
+  font-size: 12px;
+  color: #1c1c1e;
+  line-height: 1.5;
 }
 
 .modal-enter-active,

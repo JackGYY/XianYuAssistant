@@ -252,6 +252,11 @@ const handleCaptchaConfirm = () => {
   showInfo('请在闲鱼IM页面完成验证，然后使用帮助按钮获取Cookie和Token');
 };
 
+const handleCaptchaSolved = () => {
+  addLog('✅ 滑块已自动通过，正在刷新连接状态');
+  loadConnectionStatus();
+};
+
 // 关闭对话框
 const handleClose = () => {
   emit('update:modelValue', false);
@@ -498,7 +503,9 @@ onBeforeUnmount(() => {
     <!-- 滑块验证引导对话框 -->
     <CaptchaGuideDialog
       v-model="showCaptchaGuideDialog"
+      :account-id="props.accountId"
       @confirm="handleCaptchaConfirm"
+      @solved="handleCaptchaSolved"
     />
         </div>
       </div>

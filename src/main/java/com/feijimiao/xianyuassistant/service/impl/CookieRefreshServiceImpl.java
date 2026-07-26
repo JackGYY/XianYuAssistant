@@ -59,6 +59,9 @@ public class CookieRefreshServiceImpl implements CookieRefreshService {
     @Autowired(required = false)
     private com.feijimiao.xianyuassistant.service.EmailNotifyService emailNotifyService;
 
+    @Autowired(required = false)
+    private com.feijimiao.xianyuassistant.service.SliderCaptchaSolverService sliderCaptchaSolverService;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final Map<Long, Object> refreshLocks = new ConcurrentHashMap<>();
@@ -470,6 +473,19 @@ public class CookieRefreshServiceImpl implements CookieRefreshService {
                     new Page.NavigateOptions().setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
             page.reload(new Page.ReloadOptions().setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
 
+            // 若触发了滑块验证，先尝试自动过滑块，再读取最新 Cookie
+            if (sliderCaptchaSolverService != null) {
+                try {
+                    boolean solved = sliderCaptchaSolverService.trySolveInPage(accountId, page);
+                    if (solved) {
+                        log.info("【账号{}】浏览器兜底刷新过程中自动过滑块成功", accountId);
+                        page.reload(new Page.ReloadOptions().setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                    }
+                } catch (Exception e) {
+                    log.warn("【账号{}】浏览器兜底刷新过程中自动过滑块失败，继续尝试读取 Cookie", accountId, e);
+                }
+            }
+
             List<Cookie> refreshedCookies = context.cookies(List.of(
                     GOOFISH_IM_URL,
                     "https://passport.goofish.com",
@@ -629,6 +645,23 @@ public class CookieRefreshServiceImpl implements CookieRefreshService {
             cookieMap.put(cookie.name, cookie.value);
         }
         return clearDuplicateCookies(XianyuSignUtils.formatCookies(cookieMap));
+    }
+
+    @Override
+    public String autoSolveCaptcha(Long accountId) {
+        if (sliderCaptchaSolverService == null) {
+            log.warn("【账号{}】滑块自动处理服务不可用", accountId);
+            return null;
+        }
+        log.info("【账号{}】开始自动过滑块验证", accountId);
+        String newCookie = sliderCaptchaSolverService.solveCaptcha(accountId);
+        if (newCookie != null && !newCookie.isBlank()) {
+            log.info("【账号{}】自动过滑块成功，Cookie 已更新", accountId);
+            updateAccountStatusToNormal(accountId, "自动过滑块成功，账号状态恢复正常");
+        } else {
+            log.warn("【账号{}】自动过滑块失败，请尝试手动处理", accountId);
+        }
+        return newCookie;
     }
 
     @Override

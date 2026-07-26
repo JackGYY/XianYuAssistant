@@ -101,3 +101,12 @@ export function updateToken(data: { xianyuAccountId: number; websocketToken: str
     data
   });
 }
+
+// 自动过滑块验证
+export function autoSolveCaptcha(accountId: number) {
+  return request<ApiResponse<any>>({
+    url: '/account/auto-captcha',
+    method: 'POST',
+    data: { accountId }
+  });
+}
