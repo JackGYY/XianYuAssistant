@@ -102,6 +102,11 @@ public class WebSocketServiceImpl implements WebSocketService {
     // 重连次数记录（参考Python的无限重连但有退避）
     private final Map<Long, AtomicInteger> reconnectAttemptCounts = new ConcurrentHashMap<>();
 
+    // 账号维度的重连全局锁：保证同一闲鱼账号的「连接建立 / 重连事务」串行执行，
+    // 避免并发重连导致重复 stopWebSocket、连接状态错乱，或重复拉起浏览器过滑块。
+    // 同时被 startWebSocket / refreshTokenAndReconnect / scheduleReconnect 共用。
+    private final ConcurrentHashMap<Long, Object> accountReconnectLocks = new ConcurrentHashMap<>();
+
     // 邮件通知防抖记录（避免频繁发送）
     private final Map<Long, Long> lastDisconnectNotifyTimes = new ConcurrentHashMap<>();
 
@@ -119,6 +124,10 @@ public class WebSocketServiceImpl implements WebSocketService {
 
     @Override
     public boolean startWebSocket(Long accountId) {
+        // 账号维度全局锁：保证同一账号的连接建立串行，防止并发重连导致
+        // 重复 stopWebSocket、连接状态错乱，或重复拉起浏览器过滑块
+        Object lock = accountReconnectLocks.computeIfAbsent(accountId, k -> new Object());
+        synchronized (lock) {
         try {
             log.info("启动WebSocket连接: accountId={}", accountId);
 
@@ -177,6 +186,7 @@ public class WebSocketServiceImpl implements WebSocketService {
         } catch (Exception e) {
             log.error("启动WebSocket失败: accountId={}", accountId, e);
             return false;
+        }
         }
     }
 
@@ -594,6 +604,10 @@ public class WebSocketServiceImpl implements WebSocketService {
      * 4. Token刷新失败时，在token_retry_interval后重试
      */
     private void refreshTokenAndReconnect(Long accountId) {
+        // 账号维度全局锁：与 startWebSocket 共用同一把锁，保证同一账号的
+        // stop/clearToken/start 重连事务整体串行，避免并发交错
+        Object lock = accountReconnectLocks.computeIfAbsent(accountId, k -> new Object());
+        synchronized (lock) {
         try {
             log.info("【账号{}】开始刷新Token并重连...", accountId);
             
@@ -656,6 +670,7 @@ public class WebSocketServiceImpl implements WebSocketService {
                 refreshTokenAndReconnect(accountId);
             }, config.getTokenRetryInterval(), TimeUnit.SECONDS);
         }
+        }
     }
     
     /**
@@ -705,6 +720,10 @@ public class WebSocketServiceImpl implements WebSocketService {
         log.info("【账号{}】计划{}秒后执行重连（第{}次尝试）...", accountId, actualDelay, currentAttempt);
         
         ScheduledFuture<?> reconnectTask = reconnectExecutor.schedule(() -> {
+            // 账号维度全局锁：与 startWebSocket/refreshTokenAndReconnect 共用，
+            // 保证 stop+cookie检查+start 这一重连事务整体串行（startWebSocket 会重入同一把锁）
+            Object lock = accountReconnectLocks.computeIfAbsent(accountId, k -> new Object());
+            synchronized (lock) {
             try {
                 reconnectTasks.remove(accountId);
                 
@@ -770,6 +789,7 @@ public class WebSocketServiceImpl implements WebSocketService {
             } catch (Exception e) {
                 log.error("【账号{}】重连异常，将继续尝试...", accountId, e);
                 scheduleReconnect(accountId, config.getReconnectDelay(), false);
+            }
             }
         }, actualDelay, TimeUnit.SECONDS);
         

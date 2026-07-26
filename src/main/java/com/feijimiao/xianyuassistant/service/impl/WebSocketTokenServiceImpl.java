@@ -12,16 +12,20 @@ import com.feijimiao.xianyuassistant.service.AccountService;
 import com.feijimiao.xianyuassistant.service.CookieRefreshService;
 import com.feijimiao.xianyuassistant.service.EmailNotifyService;
 import com.feijimiao.xianyuassistant.service.OperationLogService;
+import com.feijimiao.xianyuassistant.service.WebSocketService;
 import com.feijimiao.xianyuassistant.service.WebSocketTokenService;
 import com.feijimiao.xianyuassistant.utils.XianyuSignUtils;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 
 import java.net.URLEncoder;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -65,6 +69,24 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
     @Autowired
     private EmailNotifyService emailNotifyService;
 
+    /**
+     * WebSocket 服务。使用 @Lazy 打破与 WebSocketServiceImpl 的循环依赖
+     * （WebSocketServiceImpl 也注入了本服务），避免初始化期相互等待。
+     */
+    @Autowired
+    @Lazy
+    private WebSocketService webSocketService;
+
+    /**
+     * 自动过滑块成功后用于主动触发后台重连的守护线程池。
+     * 低频触发（每个账号过滑块时才用一次），daemon 线程不阻塞 JVM 退出。
+     */
+    private final ExecutorService reconnectTriggerExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "auto-captcha-reconnect");
+        t.setDaemon(true);
+        return t;
+    });
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
@@ -99,6 +121,13 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
      * Key: accountId, Value: 上次尝试时间戳
      */
     private final Map<Long, Long> autoSolveAttempts = new ConcurrentHashMap<>();
+
+    /**
+     * 刚自动过滑块成功的时间标记（Key: accountId, Value: 成功时间戳）。
+     * 用途：自动过滑块后，RGV587(被挤爆啦/请稍后重试)属于时间型频控，需冷却恢复，
+     * 不应立刻再走滑块流程，而是先走冷却重试。该标记 3 分钟内有效，过期自动失效。
+     */
+    private final Map<Long, Long> autoSolvedRecently = new ConcurrentHashMap<>();
 
     /**
      * Token获取失败重试最大次数（参考Python: retry_count >= 2）
@@ -389,16 +418,23 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                     // 此时冷却重试对坏Cookie无效，应跳过冷却直接走滑块/人工验证流程（用户手动滑块即可恢复）。
                     boolean needRiskControl = retList.stream().anyMatch(ret -> ret.contains("RGV587_ERROR") || ret.contains("被挤爆啦"));
                     if (needRiskControl) {
-                        // 频控 + 滑块同现：Cookie 已失效，跳过冷却，落到下方滑块处理
                         boolean riskWithCaptcha = retList.stream().anyMatch(ret -> ret.contains("FAIL_SYS_USER_VALIDATE"));
-                        if (riskWithCaptcha) {
+                        // 刚自动过滑块：RGV587(被挤爆啦/请稍后重试)是时间型频控，需冷却而非再拉滑块。
+                        // 此时即使仍带 FAIL_SYS_USER_VALIDATE，也先走冷却重试，给风控留出恢复窗口（3分钟内有效）。
+                        boolean justSolved = autoSolvedRecently.getOrDefault(accountId, 0L) > 0
+                                && System.currentTimeMillis() - autoSolvedRecently.get(accountId) < 3 * 60 * 1000;
+                        if (riskWithCaptcha && !justSolved) {
+                            // 频控 + 滑块同现 且 非刚过滑块：Cookie 已失效，跳过冷却直接走滑块处理
                             log.warn("【账号{}】频控(被挤爆啦/RGV587) 与滑块(FAIL_SYS_USER_VALIDATE) 同时出现，判定Cookie已失效，跳过冷却直接走滑块处理", accountId);
                         } else if (riskControlRetryCount < MAX_RISK_CONTROL_RETRY) {
                             riskControlRetryCount++;
-                            log.warn("【账号{}】检测到频控(被挤爆啦/RGV587)，冷却 {} 秒后重试 (第{}/{}次)",
-                                    accountId, RISK_CONTROL_COOLDOWN / 1000, riskControlRetryCount, MAX_RISK_CONTROL_RETRY);
+                            // 刚过滑块后的频控冷却：延长等待，确保"请稍后重试"的窗口过去
+                            long cooldown = justSolved ? RISK_CONTROL_COOLDOWN * 2 : RISK_CONTROL_COOLDOWN;
+                            log.warn("【账号{}】检测到频控(被挤爆啦/RGV587)，冷却 {} 秒后重试 (第{}/{}次){}",
+                                    accountId, cooldown / 1000, riskControlRetryCount, MAX_RISK_CONTROL_RETRY,
+                                    justSolved ? "（刚自动过滑块，等待风控恢复）" : "");
                             try {
-                                Thread.sleep(RISK_CONTROL_COOLDOWN);
+                                Thread.sleep(cooldown);
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 log.warn("【账号{}】频控冷却等待被中断", accountId);
@@ -406,12 +442,19 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                             }
                             return getAccessTokenWithRetry(accountId, retryCount, riskControlRetryCount);
                         } else {
-                            log.error("【账号{}】❌ 频控冷却重试已达上限({})，转人工处理: {}",
-                                    accountId, MAX_RISK_CONTROL_RETRY, retList);
-                            log.error("【账号{}】请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie", accountId);
-                            updateCookieStatus(accountId, 3);
-                            throw new com.feijimiao.xianyuassistant.exception.CookieExpiredException(
-                                    "触发频控(被挤爆啦)，冷却重试后仍失败，请进入闲鱼网页版过滑块后更新Cookie");
+                            // 冷却重试耗尽
+                            if (justSolved) {
+                                // 自动过滑块后仍频控失败：放弃自动，转人工滑块验证（落到下方滑块分支）
+                                autoSolvedRecently.remove(accountId);
+                                log.error("【账号{}】❌ 自动过滑块后频控冷却重试仍失败，转人工滑块验证: {}", accountId, retList);
+                            } else {
+                                log.error("【账号{}】❌ 频控冷却重试已达上限({})，转人工处理: {}",
+                                        accountId, MAX_RISK_CONTROL_RETRY, retList);
+                                log.error("【账号{}】请进入闲鱼网页版-点击消息-过滑块-复制最新的Cookie", accountId);
+                                updateCookieStatus(accountId, 3);
+                                throw new com.feijimiao.xianyuassistant.exception.CookieExpiredException(
+                                        "触发频控(被挤爆啦)，冷却重试后仍失败，请进入闲鱼网页版过滑块后更新Cookie");
+                            }
                         }
                     }
 
@@ -442,6 +485,11 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
                                         String newCookie = cookieRefreshService.autoSolveCaptcha(accountId);
                                         if (newCookie != null && !newCookie.isBlank()) {
                                             log.info("【账号{}】自动过滑块成功，重新获取Token", accountId);
+                                            // 标记刚自动过滑块：后续频控(RGV587 被挤爆啦/请稍后重试)按时间型处理，
+                                            // 先走冷却重试而非立刻再拉滑块，给风控留出恢复窗口
+                                            autoSolvedRecently.put(accountId, System.currentTimeMillis());
+                                            // 主动触发一次后台重连，避免等待 refreshTokenAndReconnect 的 300s 周期
+                                            triggerImmediateReconnect(accountId);
                                             pendingCaptchaAccounts.remove(accountId);
                                             captchaTimestamps.remove(accountId);
                                             return getAccessTokenWithRetry(accountId, retryCount, 0);
@@ -966,6 +1014,41 @@ public class WebSocketTokenServiceImpl implements WebSocketTokenService {
             }
         } catch (Exception e) {
             log.error("【账号{}】保存Token到数据库失败", accountId, e);
+        }
+    }
+
+    /**
+     * 自动过滑块成功后，主动触发一次后台 WebSocket 重连。
+     * 作用：过滑块且 cookie 已刷新后，不必等待 refreshTokenAndReconnect 的 300s 兜底周期，
+     * 立刻在后台尝试重连；webSocketService.startWebSocket 内部会重新获取 token（含频控冷却重试），
+     * 连上即生效。若已被周期性重连先行连上，本调用会因「已连接」直接返回，无副作用。
+     *
+     * @param accountId 账号ID
+     */
+    private void triggerImmediateReconnect(Long accountId) {
+        try {
+            reconnectTriggerExecutor.submit(() -> {
+                try {
+                    // 稍等，确保自动过滑块写回的 cookie 已落库、风控恢复窗口开始计时
+                    Thread.sleep(2000);
+                    log.info("【账号{}】自动过滑块成功后主动触发WebSocket重连", accountId);
+                    boolean ok = webSocketService.startWebSocket(accountId);
+                    if (ok) {
+                        log.info("【账号{}】自动过滑块后主动重连成功", accountId);
+                        // 重连成功后清除「刚自动过滑块」标记，恢复正常判定
+                        autoSolvedRecently.remove(accountId);
+                        updateAccountStatusToNormal(accountId);
+                    } else {
+                        log.warn("【账号{}】自动过滑块后主动重连暂未成功（可能风控仍在冷却），将等待周期性重连兜底", accountId);
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    log.warn("【账号{}】自动过滑块后主动重连异常（将等待周期性重连兜底）: {}", accountId, e.getMessage());
+                }
+            });
+        } catch (Exception e) {
+            log.warn("【账号{}】提交主动重连任务失败: {}", accountId, e.getMessage());
         }
     }
 }

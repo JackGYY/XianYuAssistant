@@ -200,7 +200,7 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
                 return false;
             }
 
-            boolean success = dragSlider(page, slider, distance);
+            boolean success = dragSlider(page, slider, distance, frame);
             // 无论成功失败都抓取一次滑块状态，判断是否被风控（left 回弹到 0、提示文本变为失败等）
             captureSliderDiagnostics(frame, slider);
             if (success) {
@@ -394,16 +394,81 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
             if (sBox == null || tBox == null) {
                 return null;
             }
-            // 手柄右缘到轨道右缘的距离，即「划到头」所需位移
-            double distance = (tBox.x + tBox.width) - (sBox.x + sBox.width);
-            if (distance <= 0) {
-                log.debug("划到头距离异常(<=0): {}", distance);
+            // 读取内容空间下的真实尺寸，修正 iframe 缩放 / CSS 变换导致的位移偏差：
+            // nc 滑块位移以「内容坐标」计，若直接用 viewport 坐标算距离，缩放≠1 时会「划不到头」
+            //（实测：手柄仅移动到 258/316 即被判通过，正是因为视口 px ≠ 内容 px）。
+            Double trackContentW = evalDouble(track, "el => el.offsetWidth || el.clientWidth || 0");
+            Double handleContentW = evalDouble(slider, "el => el.offsetWidth || el.clientWidth || 0");
+            Double handleLeft = evalDouble(slider,
+                    "el => { const n = el.style.left; const v = parseFloat(n); return isNaN(v) ? (el.offsetLeft || 0) : v; }");
+            double scale = (trackContentW != null && trackContentW > 0) ? (trackContentW / tBox.width) : 1.0;
+            if (scale <= 0) {
+                scale = 1.0;
+            }
+            double desiredContent;
+            if (handleLeft != null && handleContentW != null && trackContentW != null) {
+                desiredContent = (trackContentW - handleContentW) - handleLeft;
+            } else {
+                // 退化为 viewport 估算
+                desiredContent = (tBox.width - sBox.width) / scale;
+            }
+            if (desiredContent <= 0) {
+                log.debug("划到头距离异常(<=0): {}", desiredContent);
                 return null;
             }
-            log.info("【滑块】轨道宽={}, 手柄宽={}, 划到头距离={}", tBox.width, sBox.width, distance);
+            // 转回 viewport 位移并留少量余量确保到头
+            double distance = desiredContent / scale + 4;
+            log.info("【滑块】轨道宽(viewport)={}, 手柄宽(viewport)={}, 缩放(content/viewport)={}, 目标内容位移={}, 划到头距离(viewport)={}",
+                    tBox.width, sBox.width, scale, desiredContent, distance);
             return distance;
         } catch (Exception e) {
             log.warn("计算划到头距离异常", e);
+            return null;
+        }
+    }
+
+    /**
+     * 判断滑块手柄是否已拖到轨道末端（内容坐标）。
+     * 之前仅凭页面文案「验证通过」判断是否成功，存在误判；这里以手柄实际位置为准。
+     */
+    private boolean isSliderReachedEnd(Frame frame, ElementHandle slider) {
+        try {
+            ElementHandle track = frame.querySelector(
+                    "[class*='nc_scale'], [class*='nc_btn'], [class*='slider'], [class*='captcha']");
+            if (track == null) {
+                track = slider;
+            }
+            Double trackW = evalDouble(track, "el => el.offsetWidth || el.clientWidth || 0");
+            Double handleW = evalDouble(slider, "el => el.offsetWidth || el.clientWidth || 0");
+            Double left = evalDouble(slider,
+                    "el => { const n = el.style.left; const v = parseFloat(n); return isNaN(v) ? (el.offsetLeft || 0) : v; }");
+            if (trackW == null || handleW == null || left == null) {
+                return false;
+            }
+            double end = trackW - handleW;
+            return left >= end - 6; // 容差 6px
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 在元素所在 frame 中执行表达式并解析为 Double
+     */
+    private Double evalDouble(ElementHandle el, String expr) {
+        try {
+            Object o = el.evaluate(expr);
+            if (o instanceof Number) {
+                return ((Number) o).doubleValue();
+            }
+            if (o instanceof String) {
+                try {
+                    return Double.parseDouble(((String) o).trim());
+                } catch (Exception ignored) {
+                }
+            }
+            return null;
+        } catch (Exception e) {
             return null;
         }
     }
@@ -545,7 +610,7 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
     /**
      * 模拟人工拖动滑块
      */
-    private boolean dragSlider(Page page, ElementHandle slider, double distance) {
+    private boolean dragSlider(Page page, ElementHandle slider, double distance, Frame frame) {
         try {
             var box = slider.boundingBox();
             if (box == null) {
@@ -565,10 +630,22 @@ public class SliderCaptchaSolverServiceImpl implements SliderCaptchaSolverServic
                 page.mouse().move(startX + p[0], startY + p[1]);
                 Thread.sleep(8 + random.nextInt(12));
             }
+            // 停在终点附近，给动画收尾时间，避免「到头」未被识别
+            page.mouse().move(startX + distance, startY);
+            Thread.sleep(150);
             page.mouse().up();
 
-            // 等待验证结果
-            return waitForSuccess(page);
+            // 以「手柄是否真正到头」作为通过依据，杜绝误判
+            // （之前 handle.left 仅到 258/316 却判通过，导致风控从未清除）
+            boolean reached = isSliderReachedEnd(frame, slider);
+            boolean success = waitForSuccess(page);
+            captureSliderDiagnostics(frame, slider);
+            if (reached) {
+                log.info("【滑块】手柄已真正到头，判定验证通过");
+                return true;
+            }
+            log.warn("【滑块】手柄未到头，验证未真正通过 (reached={}, success={})", reached, success);
+            return false;
         } catch (Exception e) {
             log.warn("拖动滑块异常", e);
             return false;
